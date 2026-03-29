@@ -22,12 +22,12 @@ void updateLCD(int soil, float temp, float humid, bool pump);
 // ============ PIN DEFINITIONS ============
 #define SOIL_PIN 4
 #define DHT_PIN 15
-#define RELAY_PIN 5
+#define RELAY_PIN 12
 #define LED_PIN 2
 #define SD_CLK 17
 #define SD_CS 16
 #define SD_MOSI 18
-#define SD_MISO 11
+#define SD_MISO 13
 
 // LCD pins (RS, E, DB4, DB5, DB6, DB7)
 LiquidCrystal lcd(5, 6, 7, 8, 9, 10);
@@ -91,9 +91,9 @@ bool sdCardOK = false;
 
 void initSDCard() {
     // Initialize SPI with custom pins if needed
+    SPI.begin(SD_CLK, SD_MISO, SD_MOSI, SD_CS);
     
-    
-    if (!SD.begin(16)) {  // CS pin = GPIO10
+    if (!SD.begin(SD_CS)) {  
         Serial.println("SD Card Mount Failed");
         sdCardOK = false;
         return;
