@@ -4,6 +4,9 @@
 #include <BLEDevice.h>
 #include <BLEServer.h>
 #include <BLEUtils.h>
+#include <FS.h>
+#include <SD.h>
+#include <SPI.h>
 
 // ============ FUNCTION PROTOTYPES (ADDED TO FIX ERRORS) ============
 void startPump(int seconds);
@@ -21,6 +24,10 @@ void updateLCD(int soil, float temp, float humid, bool pump);
 #define DHT_PIN 15
 #define RELAY_PIN 5
 #define LED_PIN 2
+#define SD_CLK 17
+#define SD_CS 16
+#define SD_MOSI 18
+#define SD_MISO 11
 
 // LCD pins (RS, E, DB4, DB5, DB6, DB7)
 LiquidCrystal lcd(5, 6, 7, 8, 9, 10);
@@ -69,7 +76,7 @@ class CommandCallbacks : public BLECharacteristicCallbacks {
     void onWrite(BLECharacteristic* pCharacteristic) {
         String cmd = pCharacteristic->getValue().c_str();
         cmd.trim();
-       
+        
         if (cmd == "WATER" || cmd == "1") {
             startPump(5);
         } else if (cmd == "STOP" || cmd == "0") {
@@ -80,11 +87,83 @@ class CommandCallbacks : public BLECharacteristicCallbacks {
     }
 };
 
+bool sdCardOK = false;
+
+void initSDCard() {
+    // Initialize SPI with custom pins if needed
+    
+    
+    if (!SD.begin(16)) {  // CS pin = GPIO10
+        Serial.println("SD Card Mount Failed");
+        sdCardOK = false;
+        return;
+    }
+    
+    sdCardOK = true;
+    Serial.println("SD Card Mounted Successfully");
+    
+    // Get card type
+    uint8_t cardType = SD.cardType();
+    if (cardType == CARD_NONE) {
+        Serial.println("No SD card attached");
+        return;
+    }
+    
+    Serial.print("SD Card Type: ");
+    if (cardType == CARD_MMC) Serial.println("MMC");
+    else if (cardType == CARD_SD) Serial.println("SDSC");
+    else if (cardType == CARD_SDHC) Serial.println("SDHC");
+    else Serial.println("UNKNOWN");
+    
+    // Print card size
+    uint64_t cardSize = SD.cardSize() / (1024 * 1024);
+    Serial.printf("SD Card Size: %lluMB\n", cardSize);
+    
+    // Create CSV file with headers if it doesn't exist
+    if (!SD.exists("/irrigation.csv")) {
+        File file = SD.open("/irrigation.csv", FILE_WRITE);
+        if (file) {
+            file.println("Timestamp,Soil_%,Temp_F,Humidity_%,Pump_Status");
+            file.close();
+            Serial.println("Created irrigation.csv");
+        }
+    }
+}
+
+void logToSD(int soil, float tempF, float humidity, bool pumpActive) {
+    if (!sdCardOK) return;
+    
+    File file = SD.open("/irrigation.csv", FILE_APPEND);
+    if (!file) {
+        Serial.println("Failed to open file for appending");
+        return;
+    }
+    
+    // Use millis() for timestamp or add RTC for real time
+    file.print(millis());
+    file.print(",");
+    file.print(soil);
+    file.print(",");
+    file.print(tempF);
+    file.print(",");
+    file.print(humidity);
+    file.print(",");
+    file.println(pumpActive ? "ON" : "OFF");
+    
+    file.close();
+}
+
 // ============ SETUP ============
 void setup() {
+    // Set up contrast control on GPIO 3
+    pinMode(3, OUTPUT);
+    
+    // Start with medium contrast
+    analogWrite(3, 80);  // 0=dark, 255=light
+    
     delay(5000);
     Serial.begin(115200);
-   
+    
     int timeout = 0;
     while (!Serial && timeout < 10) {
       delay(100);
@@ -117,18 +196,20 @@ void setup() {
     pService->start();
     pServer->getAdvertising()->start();
 
+    initSDCard();
+
     // Initialize hardware
     pinMode(RELAY_PIN, OUTPUT);
     digitalWrite(RELAY_PIN, LOW);  // Pump off initially
-   
+    
     pinMode(LED_PIN, OUTPUT);
     digitalWrite(LED_PIN, HIGH);   // LED on = system ready
-   
+    
     dht.begin();
 
     delay(2000);
     lcd.clear();
-   
+    
     Serial.println(F("System Ready"));
     printHelp();
 }
@@ -136,25 +217,25 @@ void setup() {
 // ============ LOOP ============
 void loop() {
     unsigned long now = millis();
-   
+    
     if (now - lastSensorRead >= READ_INTERVAL) {
         readSensors();
         lastSensorRead = now;
     }
-   
+    
     if (now - lastSerialPrint >= SERIAL_INTERVAL) {
         printStatus();
         lastSerialPrint = now;
     }
-   
+    
     if (pumpActive && now >= pumpStopTime) {
         stopPump();
     }
-   
+    
     if (Serial.available()) {
         handleCommand();
     }
-   
+    
     delay(10);
 }
 
@@ -164,16 +245,18 @@ void readSensors() {
     int rawSoil = analogRead(SOIL_PIN);
     int soilPercent = map(rawSoil, dryValue, wetValue, 0, 100);
     soilPercent = constrain(soilPercent, 0, 100);
-   
+    
     // read temperature (F)
     float tempC = dht.readTemperature();
     float tempF = (tempC * 9.0/5.0) + 32.0;
     float humidity = dht.readHumidity();
-   
-    // Handle DHT errors
+    
+    // Handle DHT errors 
     if (isnan(tempF) || isnan(humidity)) {
         return;
     }
+
+    logToSD(soilPercent, tempF, humidity, pumpActive);
 
     // Update LCD display
     updateLCD(soilPercent, tempF, humidity, pumpActive);
@@ -185,7 +268,7 @@ void readSensors() {
         pCharacteristic->notify();
         Serial.println("Sending: " + data);
     }
-   
+    
     // AUTO WATERING DECISION
     if (!pumpActive && soilPercent < moistureThreshold) {
         Serial.println(F("\n SOIL DRY - Starting pump"));
@@ -199,14 +282,14 @@ void updateLCD(int soil, float temp, float humid, bool pump) {
     lcd.print("Soil:");
     lcd.print(soil);
     lcd.print("%  ");
-   
+    
     lcd.setCursor(0, 1);
     lcd.print("T:");
     lcd.print(temp, 0);
     lcd.print("F H:");
     lcd.print(humid, 0);
     lcd.print("%");
-   
+    
     lcd.setCursor(12, 0);
     if (pump) {
         lcd.print("ON ");
@@ -220,7 +303,7 @@ void startPump(int seconds) {
     Serial.print(F("→ Pump ON for "));
     Serial.print(seconds);
     Serial.println(F(" seconds"));
-   
+    
     digitalWrite(RELAY_PIN, HIGH);  // Turn pump on
     pumpActive = true;
     pumpStopTime = millis() + (seconds * 1000);
@@ -247,38 +330,38 @@ void stopPump() {
 // ============ PRINT STATUS TO MONITOR ============
 void printStatus() {
     Serial.println(F("\n--- SYSTEM STATUS ---"));
-   
+    
     // Read current values
     int rawSoil = analogRead(SOIL_PIN);
     int soilPercent = map(rawSoil, dryValue, wetValue, 0, 100);
     soilPercent = constrain(soilPercent, 0, 100);
-   
+    
     float tempC = dht.readTemperature();
     float tempF = (tempC * 9.0/5.0) + 32.0;
     float humidity = dht.readHumidity();
-   
+    
     // Print soil
     Serial.print(F("Soil: "));
     Serial.print(soilPercent);
     Serial.print(F("% (raw: "));
     Serial.print(rawSoil);
     Serial.println(F(")"));
-   
+    
     // Print temperature/humidity
     if (!isnan(tempF)) {
         Serial.print(F("Temp: "));
         Serial.print(tempF);
         Serial.println(F("°F"));
-       
+        
         Serial.print(F("Humidity: "));
         Serial.print(humidity);
         Serial.println(F("%"));
     }
-   
+    
     // Print pump status
     Serial.print(F("Pump: "));
     Serial.println(pumpActive ? F("ON") : F("OFF"));
-   
+    
     if (pumpActive) {
         int secLeft = (pumpStopTime - millis()) / 1000;
         Serial.print(F("Time left: "));
@@ -288,7 +371,7 @@ void printStatus() {
 
     Serial.print(F("Bluetooth: "));
     Serial.println(deviceConnected ? F("Connected") : F("Waiting"));
-   
+    
     Serial.println(F("----------------------"));
 }
 
@@ -300,7 +383,7 @@ void calibrateSensors() {
     while (!Serial.available());
     Serial.read();
     delay(2000);
-   
+    
     // Read dry value
     Serial.print(F("Reading DRY..."));
     int dryTotal = 0;
@@ -312,13 +395,13 @@ void calibrateSensors() {
     dryValue = dryTotal / 10;
     Serial.print(F(" DRY = "));
     Serial.println(dryValue);
-   
+    
     Serial.println(F("\nStep 2: Place sensor in WATER"));
     Serial.println(F("Press any key when ready..."));
     while (!Serial.available());
     Serial.read();
     delay(2000);
-   
+    
     // Read wet value
     Serial.print(F("Reading WET..."));
     int wetTotal = 0;
@@ -330,7 +413,7 @@ void calibrateSensors() {
     wetValue = wetTotal / 10;
     Serial.print(F(" WET = "));
     Serial.println(wetValue);
-   
+    
     // Show results
     Serial.println(F("\n Calibration Complete"));
     Serial.print(F("dryValue = "));
@@ -347,30 +430,30 @@ void handleCommand() {
 
     Serial.print("You typed: ");
     Serial.print(cmd);
-   
+    
     switch(cmd) {
         case '1':
             Serial.println(F("\n Manual pump test"));
             startPump(3);
             break;
-           
+            
         case '0':
             if (pumpActive) {
                 Serial.println(F("\n Manual stop"));
                 stopPump();
             }
             break;
-           
+            
         case 'c':
         case 'C':
             calibrateSensors();
             break;
-           
+            
         case 's':
         case 'S':
             printStatus();
             break;
-           
+            
         case 'h':
         case 'H':
         case '?':
