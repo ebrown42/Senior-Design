@@ -117,29 +117,6 @@ class CommandCallbacks : public BLECharacteristicCallbacks {
             Serial.println("BLE Command: STOP");
             stopPump();
         }
-        else if (cmd == "DOWNLOAD" || cmd == "D") {
-            Serial.println("BLE Command: DOWNLOAD - Sending CSV file...");
-            File file = SD.open("/irrigation.csv");
-            if (!file) {
-                pCharacteristic->setValue("ERROR: No data file found");
-                pCharacteristic->notify();
-                Serial.println("CSV file not found");
-                return;
-            }
-            
-            // Send file line by line
-            while (file.available()) {
-                String line = file.readStringUntil('\n');
-                pCharacteristic->setValue(line.c_str());
-                pCharacteristic->notify();
-                delay(50);  // Small delay to prevent overwhelming Bluetooth buffer
-            }
-            file.close();
-            
-            pCharacteristic->setValue("=== END OF FILE ===");
-            pCharacteristic->notify();
-            Serial.println("CSV file sent successfully");
-        }
     }
 };
 
