@@ -24,16 +24,22 @@ void updateLCD(int soil, float temp, float humid, bool pump);
 
 // ============ PIN DEFINITIONS ============
 #define SOIL_PIN 4
-#define DHT_PIN 15
-#define RELAY_PIN 12
+#define DHT_PIN 5 //15
+#define RELAY_PIN 6 //12
 #define LED_PIN 2
-#define SD_CLK 17
-#define SD_CS 16
-#define SD_MOSI 18
+//#define SD_CLK 17
+//#define SD_CS 16
+//#define SD_MOSI 18
+//#define SD_MISO 13
+
+#define SD_CS 14
+#define SD_SCK 12
+#define SD_MOSI 11
 #define SD_MISO 13
 
 // LCD pins (RS, E, DB4, DB5, DB6, DB7)
-LiquidCrystal lcd(5, 6, 7, 8, 9, 10);
+//LiquidCrystal lcd(5, 6, 7, 8, 9, 10);
+LiquidCrystal lcd(15, 16, 17, 18, 21, 47);
 
 // ============ BLE UUIDs ============
 #define SERVICE_UUID "9366ae51-983c-473d-a47d-0735e0a752c7"
@@ -52,14 +58,16 @@ typedef struct {
 slaveData_t slaveData;
 bool waterRequestedBySlave = false;
 
+bool calibrationMode = false;
+
 // ============ CALIBRATION ============
-int dryValue = 2597;
-int wetValue = 1046;
+int dryValue = 2514;
+int wetValue = 912;
 int moistureThreshold = 80;
 
 #define PUMP_RUN_TIME     5
-#define READ_INTERVAL     2000
-#define SERIAL_INTERVAL   5000
+#define READ_INTERVAL     5000
+#define SERIAL_INTERVAL   10000
 
 // ============ COOLDOWN VARIABLES ============
 unsigned long lastPumpTrigger = 0;
@@ -109,12 +117,35 @@ class CommandCallbacks : public BLECharacteristicCallbacks {
             Serial.println("BLE Command: STOP");
             stopPump();
         }
+        else if (cmd == "DOWNLOAD" || cmd == "D") {
+            Serial.println("BLE Command: DOWNLOAD - Sending CSV file...");
+            File file = SD.open("/irrigation.csv");
+            if (!file) {
+                pCharacteristic->setValue("ERROR: No data file found");
+                pCharacteristic->notify();
+                Serial.println("CSV file not found");
+                return;
+            }
+            
+            // Send file line by line
+            while (file.available()) {
+                String line = file.readStringUntil('\n');
+                pCharacteristic->setValue(line.c_str());
+                pCharacteristic->notify();
+                delay(50);  // Small delay to prevent overwhelming Bluetooth buffer
+            }
+            file.close();
+            
+            pCharacteristic->setValue("=== END OF FILE ===");
+            pCharacteristic->notify();
+            Serial.println("CSV file sent successfully");
+        }
     }
 };
 
 // ============ SD CARD FUNCTIONS ============
 void initSDCard() {
-    SPI.begin(SD_CLK, SD_MISO, SD_MOSI, SD_CS);
+    SPI.begin(SD_SCK, SD_MISO, SD_MOSI, SD_CS);
     
     if (!SD.begin(SD_CS)) {
         Serial.println("SD Card Mount Failed");
@@ -172,27 +203,29 @@ void logToSD(int soil, float tempF, float humidity, bool pumpActive) {
 }
 
 // ============ ESP-NOW RECEIVE CALLBACK ============
+unsigned long lastSlavePrint = 0;
 void OnDataRecv(const esp_now_recv_info_t *esp_now_info, const uint8_t *incomingData, int len) {
     memcpy(&slaveData, incomingData, sizeof(slaveData));
 
-    Serial.println("=================================");
-    Serial.println("DATA FROM SLAVE");
-    Serial.println("=================================");
-    Serial.print("Slave Soil: ");
-    Serial.print(slaveData.soilPercent);
-    Serial.println("%");
-    Serial.print("Slave Temp: ");
-    Serial.print(slaveData.tempF);
-    Serial.println("°F");
-    Serial.print("Slave Humidity: ");
-    Serial.print(slaveData.humidity);
-    Serial.println("%");
+    if(!calibrationMode && (millis() - lastSlavePrint > 10000)) {
+        lastSlavePrint = millis();
+        Serial.println("DATA FROM SLAVE");
+        Serial.print("Slave Soil: ");
+        Serial.print(slaveData.soilPercent);
+        Serial.println("%");
+        Serial.print("Slave Temp: ");
+        Serial.print(slaveData.tempF);
+        Serial.println("°F");
+        Serial.print("Slave Humidity: ");
+        Serial.print(slaveData.humidity);
+        Serial.println("%");
+    }
 
     if (slaveData.requestWater) {
         Serial.println("Water request from slave");
         waterRequestedBySlave = true;
     }
-    Serial.println("=================================\n");
+    //Serial.println("=================================\n");
 }
 
 // ============ SETUP ============
@@ -262,10 +295,16 @@ void setup() {
 // ============ LOOP ============
 void loop() {
     unsigned long now = millis();
-    
-    if (now - lastSensorRead >= READ_INTERVAL) {
+
+    // Only read sensors if NOT in calibration mode (ONLY ONCE!)
+    if (!calibrationMode && (now - lastSensorRead >= READ_INTERVAL)) {
         readSensors();
         lastSensorRead = now;
+    }
+
+    // Handle Serial commands (ONLY ONCE!)
+    if (Serial.available()) {
+        handleCommand();
     }
 
     // Handle water request from slave (with cooldown)
@@ -287,10 +326,6 @@ void loop() {
     
     if (pumpActive && now >= pumpStopTime) {
         stopPump();
-    }
-    
-    if (Serial.available()) {
-        handleCommand();
     }
     
     delay(10);
@@ -440,6 +475,10 @@ void stopPump() {
 
 // ============ STATUS ============
 void printStatus() {
+    if (calibrationMode) {
+        return;
+    }
+    
     Serial.println(F("\n--- SYSTEM STATUS ---"));
     
     int rawSoil = analogRead(SOIL_PIN);
@@ -482,13 +521,25 @@ void printStatus() {
 
 // ============ CALIBRATION ============
 void calibrateSensors() {
+    calibrationMode = true;
+    
+    // Clear any pending serial data
+    while (Serial.available()) {
+        Serial.read();
+    }
+    
     Serial.println(F("\n=== CALIBRATION MODE ==="));
     Serial.println(F("Step 1: Place sensor in DRY air"));
     Serial.println(F("Press any key when ready..."));
-    while (!Serial.available());
-    Serial.read();
+    while (!Serial.available()) {
+        delay(100);
+    }
+    while (Serial.available()) {
+        Serial.read();
+    }
     delay(2000);
     
+    Serial.print(F("Reading DRY..."));
     int dryTotal = 0;
     for(int i = 0; i < 10; i++) {
         dryTotal += analogRead(SOIL_PIN);
@@ -501,10 +552,15 @@ void calibrateSensors() {
     
     Serial.println(F("\nStep 2: Place sensor in WATER"));
     Serial.println(F("Press any key when ready..."));
-    while (!Serial.available());
-    Serial.read();
+    while (!Serial.available()) {
+        delay(100);
+    }
+    while (Serial.available()) {
+        Serial.read();
+    }
     delay(2000);
     
+    Serial.print(F("Reading WET..."));
     int wetTotal = 0;
     for(int i = 0; i < 10; i++) {
         wetTotal += analogRead(SOIL_PIN);
@@ -520,7 +576,26 @@ void calibrateSensors() {
     Serial.println(dryValue);
     Serial.print(F("wetValue = "));
     Serial.println(wetValue);
+    Serial.println();
+    
+    // ===== CRITICAL PAUSE =====
+    Serial.println("====================================");
+    Serial.println("CALIBRATION DONE - Press any key to continue");
+    Serial.println("====================================");
+    
+    // This loop does NOTHING else until a key is pressed
+    while (!Serial.available()) {
+        delay(50);  // Small delay, no sensor reads, no status prints
+    }
+    
+    // Clear the buffer
+    while (Serial.available()) {
+        Serial.read();
+    }
+    
+    calibrationMode = false;
 }
+
 
 // ============ COMMANDS ============
 void handleCommand() {
